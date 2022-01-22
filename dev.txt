@@ -1,0 +1,14 @@
+[controller]
+localhost ansible_connection=local
+
+[master]
+pi1a.local ansible_user=ubuntu hostname=pi1 ip=192.168.70.31
+
+[leaves]
+pi2a.local ansible_user=ubuntu hostname=pi2 ip=192.168.70.32
+pi3a.local ansible_user=ubuntu hostname=pi3 ip=192.168.70.33
+pi4a.local ansible_user=ubuntu hostname=pi4 ip=192.168.70.34
+
+[raspberries:children]
+master
+leaves

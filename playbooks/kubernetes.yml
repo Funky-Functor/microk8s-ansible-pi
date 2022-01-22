@@ -1,0 +1,157 @@
+---
+  - hosts: controller
+    gather_facts: no
+    vars:
+      sshkeyName: id_ssh_rsa
+      oldpass: ubuntu
+      userpass: password
+      sshkey: "{{ lookup('env','HOME') + '/.ssh/' + sshkeyName }}"
+    tasks:
+    - name: Generate an OpenSSH keypair with the default values (4096 bits, rsa)
+      community.crypto.openssh_keypair:
+        path: "{{ sshkey }}"
+      tags:
+        - generate_ssh_key_host
+    - name: change default password the first time we connect
+      ansible.builtin.expect:
+        command: 'ssh {{ item }}'
+        responses:
+          "Are you sure you want to continue connecting(.*)": "yes"
+          "^(.*)'s password(.*)": "{{ oldpass }}"
+          "Current password(.*)": "{{ oldpass }}"
+          "New password(.*)": '{{ userpass }}'
+          "Retype new password(.*)": '{{ userpass }}'
+      loop: "{{ groups['raspberries'] }}"
+      tags:
+        - ssh_init
+
+  - hosts: raspberries
+    become: yes
+    vars:
+      sshkeyName: id_ssh_rsa
+      userpass: password
+      sshkey: "{{ lookup('env','HOME') + '/.ssh/' + sshkeyName }}"
+      tempSshKey: "/opt/{{ sshkeyName }}"
+    tasks:
+    - name: Set authorized key taken from file
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ lookup('file', sshkey + '.pub') }}"
+      tags:
+        - ssh_init_pies
+    - name: Update the '/etc/hosts' file with addresses of the other pies
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        search_string: "{{ hostvars[item]['ip'] }}" 
+        line: "{{ hostvars[item]['ip'] }} {{ hostvars[item]['hostname'] }} {{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+        create: True
+      loop: "{{ groups['raspberries'] }}"
+      tags:
+        - hosts_update
+    - name: Generate an OpenSSH keypair with the default values (4096 bits, rsa)
+      community.crypto.openssh_keypair:
+        path: "{{ tempSshKey }}"
+      tags:
+        - generate_ssh_key_pies
+    - name: Share SSH key amongst the nodes of the cluster
+      ansible.builtin.expect:
+        command: "sudo ssh-copy-id -i {{ tempSshKey }}.pub {{ ansible_user }}@{{ item }}"
+        responses:
+          "Are you sure you want to continue connecting(.*)" : "yes"
+          "^(.*)'s password(.*)": '{{ userpass }}'
+      loop: "{{ groups['raspberries'] }}"
+      tags:
+        - share_ssh_keys
+    - name: Copy a new "cmdline.txt" file into place
+      ansible.builtin.copy:
+        src: ../resources/cmdline.txt
+        dest: /boot/firmware/cmdline.txt
+        owner: root
+        group: root
+        mode: '0755'
+        #backup: yes
+      tags:
+        - cmdline
+    - name: Restart machine to apply changes
+      reboot:
+      tags:
+        - restart_1
+        - restart
+    - name: Update all packages to their latest version
+      apt:
+       name: "*"
+       update_cache: yes
+       state: latest
+      tags:
+        - update
+    - name: Install Microk8s
+      community.general.snap:
+        name: microk8s
+        classic: yes
+      tags:
+        - microk8s_install
+    - name: "Adding the {{ ansible_user }} user to the 'microk8s' group"
+      user:
+        name: "{{ ansible_user }}"
+        groups: 'microk8s'
+        append: yes
+      tags:
+        - post_microk8s_setup
+    - name: "Changing owner of file '~/.kube' to the {{ ansible_user }} user"
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        owner: "{{ ansible_user }}"
+        recurse: true
+      tags:
+        - post_microk8s_setup
+    - name: Adding an alias for kubectl
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.bash_aliases"
+        line: "alias kubectl='microk8s kubectl'"
+        create: True
+      tags:
+        - kubectl_alias
+        - post_microk8s_setup
+    - name: Change hostname to proper value
+      hostname:
+        name: "{{ hostname }}"
+      tags:
+        - hostname
+    - name: Restart machine to apply changes
+      reboot:
+      tags:
+        - restart_2
+        - restart
+
+  - hosts: leaves
+    gather_facts: no
+    vars:
+      sshkeyName: id_ssh_rsa
+      userpass: password
+      tempSshKey: "/opt/{{ sshkeyName }}"
+    become: yes
+    tasks:
+    - name: Retrieve the token from master
+      ansible.builtin.command: "ssh {{ ansible_user }}@{{ item }} -i {{ tempSshKey }} 'microk8s add-node | tail -n 1'"
+      loop: "{{ groups['master'] }}"
+      register: add_node_command
+      tags:
+        - retrieve_token
+        - add_node
+    - name: Run the command obtained from the master
+      ansible.builtin.command: "{{ add_node_command['results'][0]['stdout'] }}"
+      tags:
+        - add_node
+        - add_node_command
+
+  - hosts: master
+    gather_facts: no
+    tasks:
+    - name: Activate Microk8s extensions
+      ansible.builtin.command: microk8s enable dns storage portainer
+      tags:
+        - active_mk8s_addons
